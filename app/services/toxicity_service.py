@@ -18,9 +18,12 @@ MODEL_NAME = (
 class ToxicityService:
     """
     Servicio encargado de analizar la toxicidad de un texto.
+
+    El umbral de rechazo se recibe dinámicamente desde la
+    configuración global de moderación.
     """
 
-    REJECT_THRESHOLD = 0.80
+    DEFAULT_REJECT_THRESHOLD = 0.80
 
     def __init__(self) -> None:
         self.classifier = self._load_model()
@@ -44,10 +47,27 @@ class ToxicityService:
     def moderate(
         self,
         content: str,
+        threshold: float = DEFAULT_REJECT_THRESHOLD,
     ) -> ModerateResponse:
         """
-        Ejecuta el proceso completo de moderación.
+        Analiza el texto aplicando el umbral indicado.
+
+        Args:
+            content: Texto que se quiere analizar.
+            threshold: Puntuación mínima para rechazar el contenido.
+
+        Returns:
+            Resultado completo de la moderación.
+
+        Raises:
+            ValueError: Si el umbral no está entre 0 y 1.
+            RuntimeError: Si el modelo devuelve un resultado inválido.
         """
+
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                "El umbral de toxicidad debe estar entre 0 y 1."
+            )
 
         prediction = self._predict(content)
 
@@ -56,22 +76,28 @@ class ToxicityService:
         )
 
         decision = self._get_decision(
-            toxic_score
+            toxic_score=toxic_score,
+            threshold=threshold,
         )
+
+        rounded_score = round(toxic_score, 6)
 
         return ModerateResponse(
             decision=decision,
             allowed=(
                 decision == ModerationDecision.APPROVE
             ),
-            score=round(toxic_score, 6),
+            score=rounded_score,
             categories=[
                 CategoryResult(
                     label="toxicity",
-                    score=round(toxic_score, 6),
+                    score=rounded_score,
                 )
             ],
-            reason=self._get_reason(decision),
+            reason=self._get_reason(
+                decision=decision,
+                threshold=threshold,
+            ),
             model=MODEL_NAME,
         )
 
@@ -145,16 +171,17 @@ class ToxicityService:
             f"Etiqueta desconocida devuelta por el modelo: {label}"
         )
 
-    @classmethod
+    @staticmethod
     def _get_decision(
-        cls,
         toxic_score: float,
+        threshold: float,
     ) -> ModerationDecision:
         """
-        Convierte la puntuación en una decisión binaria.
+        Convierte la puntuación en una decisión binaria usando
+        el umbral configurado.
         """
 
-        if toxic_score >= cls.REJECT_THRESHOLD:
+        if toxic_score >= threshold:
             return ModerationDecision.REJECT
 
         return ModerationDecision.APPROVE
@@ -162,13 +189,17 @@ class ToxicityService:
     @staticmethod
     def _get_reason(
         decision: ModerationDecision,
+        threshold: float,
     ) -> str:
+        formatted_threshold = round(threshold, 3)
+
         if decision == ModerationDecision.REJECT:
             return (
-                "El contenido supera el umbral de toxicidad."
+                "El contenido supera el umbral de toxicidad "
+                f"configurado ({formatted_threshold})."
             )
 
         return (
-            "No se ha detectado toxicidad suficiente "
-            "para bloquear el contenido."
+            "El contenido no supera el umbral de toxicidad "
+            f"configurado ({formatted_threshold})."
         )

@@ -10,8 +10,8 @@ from fastapi import (
 from app.schemas.moderation import (
     ModerateRequest,
     ModerateResponse,
-    ModerationDecision,
 )
+from app.services.moderation_service import ModerationService
 from app.services.pii_service import PiiService
 from app.services.toxicity_service import ToxicityService
 
@@ -20,6 +20,15 @@ router = APIRouter(
     prefix="/moderate",
     tags=["Moderation"],
 )
+
+
+@lru_cache
+def get_pii_service() -> PiiService:
+    """
+    Crea y reutiliza una única instancia del detector PII.
+    """
+
+    return PiiService()
 
 
 @lru_cache
@@ -32,12 +41,16 @@ def get_toxicity_service() -> ToxicityService:
 
 
 @lru_cache
-def get_pii_service() -> PiiService:
+def get_moderation_service() -> ModerationService:
     """
-    Crea y reutiliza el detector de datos personales.
+    Crea el servicio coordinador utilizando las instancias
+    reutilizables de PII y toxicidad.
     """
 
-    return PiiService()
+    return ModerationService(
+        pii_service=get_pii_service(),
+        toxicity_service=get_toxicity_service(),
+    )
 
 
 @router.post(
@@ -46,37 +59,22 @@ def get_pii_service() -> PiiService:
     status_code=status.HTTP_200_OK,
     summary="Moderar contenido textual",
     description=(
-        "Detecta datos personales y analiza la toxicidad "
-        "del contenido."
+        "Modera contenido aplicando la configuración global "
+        "administrada mediante los endpoints de settings."
     ),
 )
 def moderate(
     request: ModerateRequest,
-    pii_service: PiiService = Depends(get_pii_service),
-    toxicity_service: ToxicityService = Depends(
-        get_toxicity_service
+    moderation_service: ModerationService = Depends(
+        get_moderation_service
     ),
 ) -> ModerateResponse:
     try:
-        pii_result = pii_service.analyze(
+        return moderation_service.moderate(
             request.content
         )
 
-        if pii_result.detected:
-            return ModerateResponse(
-                decision=ModerationDecision.REJECT,
-                allowed=False,
-                score=1.0,
-                categories=pii_result.categories,
-                reason=pii_result.reason,
-                model=PiiService.MODEL_NAME,
-            )
-
-        return toxicity_service.moderate(
-            request.content
-        )
-
-    except RuntimeError as error:
+    except (RuntimeError, ValueError) as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(error),
