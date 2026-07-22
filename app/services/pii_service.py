@@ -141,31 +141,38 @@ class PiiService:
         re.IGNORECASE | re.VERBOSE,
     )
 
-    PHONE_CONTEXT_PATTERN = re.compile(
+    PHONE_PATTERN = re.compile(
         r"""
         \b
         (?:
-            tel[eé]fono
-            |
-            m[oó]vil
-            |
-            contacto
-            |
-            whatsapp
-            |
-            bizum
-            |
-            llamar
-            |
-            ll[aá]mame
-            |
-            escr[ií]beme
+            teléfono
+            | telefono
+            | móvil
+            | movil
+            | número
+            | numero
+            | contacto
+            | whatsapp
+            | bizum
+            | llamar
+            | llámame
+            | llamame
+            | escríbeme
+            | escribeme
         )
-        \b
-        [^\d+]{0,30}
-        (?:\+34[\s.-]?)?
-        [6789]
-        (?:[\s.-]?\d){8}
+        \s*
+        (?:
+            es
+            |:
+            |-
+            |al
+            |de
+        )?
+        \s*
+        (?:
+            \+34[\s.-]*
+        )?
+        (?P<phone>[6789](?:[\s.-]*\d){8})
         \b
         """,
         re.IGNORECASE | re.VERBOSE,
