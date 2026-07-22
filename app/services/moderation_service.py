@@ -1,12 +1,8 @@
 from app.schemas.moderation import (
-    CategoryResult,
     ModerateResponse,
     ModerationDecision,
 )
-from app.schemas.settings import (
-    ModerationSettings,
-    PiiCategorySettings,
-)
+from app.schemas.settings import ModerationSettings
 from app.services.pii_service import PiiService
 from app.services.settings_service import settings_service
 from app.services.toxicity_service import ToxicityService
@@ -14,61 +10,49 @@ from app.services.toxicity_service import ToxicityService
 
 class ModerationService:
     """
-    Coordina todo el proceso de moderación.
+    Orquesta el proceso completo de moderación.
 
-    Orden de ejecución:
+    Orden de análisis:
 
-    1. Recuperar la configuración global.
-    2. Comprobar lista blanca.
-    3. Comprobar lista negra.
-    4. Ejecutar el detector PII si está activado.
-    5. Ejecutar el detector de toxicidad si está activado.
-    6. Devolver APPROVE o REJECT.
+    1. Whitelist.
+    2. Blacklist.
+    3. Información personal.
+    4. Toxicidad.
+
+    La configuración se obtiene dinámicamente en cada petición.
     """
 
-    def __init__(
-        self,
-        pii_service: PiiService,
-        toxicity_service: ToxicityService,
-    ) -> None:
-        self.pii_service = pii_service
-        self.toxicity_service = toxicity_service
+    def __init__(self) -> None:
+        self.pii_service = PiiService()
+        self.toxicity_service = ToxicityService()
 
     def moderate(
         self,
         content: str,
     ) -> ModerateResponse:
+        """
+        Modera un texto utilizando la configuración activa.
+        """
+
         settings = settings_service.get()
 
-        normalized_content = self._normalize(content)
+        normalized_content = content.casefold().strip()
 
-        # La whitelist utiliza coincidencia exacta para evitar que una
-        # palabra común permita saltarse toda la moderación.
-        if self._matches_whitelist(
-            normalized_content,
-            settings.whitelist,
-        ):
-            return self._build_policy_response(
-                decision=ModerationDecision.APPROVE,
-                label="whitelist",
-                reason=(
-                    "El contenido completo coincide con una entrada "
-                    "de la lista blanca."
-                ),
-            )
+        whitelist_response = self._moderate_whitelist(
+            content=normalized_content,
+            settings=settings,
+        )
 
-        if self._matches_blacklist(
-            normalized_content,
-            settings.blacklist,
-        ):
-            return self._build_policy_response(
-                decision=ModerationDecision.REJECT,
-                label="blacklist",
-                reason=(
-                    "El contenido contiene una expresión incluida "
-                    "en la lista negra."
-                ),
-            )
+        if whitelist_response is not None:
+            return whitelist_response
+
+        blacklist_response = self._moderate_blacklist(
+            content=normalized_content,
+            settings=settings,
+        )
+
+        if blacklist_response is not None:
+            return blacklist_response
 
         pii_response = self._moderate_pii(
             content=content,
@@ -78,11 +62,33 @@ class ModerationService:
         if pii_response is not None:
             return pii_response
 
-        if settings.toxicity.enabled:
-            return self.toxicity_service.moderate(
-                content=content,
-                threshold=settings.toxicity.threshold,
-            )
+        return self._moderate_toxicity(
+            content=content,
+            settings=settings,
+        )
+
+    @staticmethod
+    def _moderate_whitelist(
+        content: str,
+        settings: ModerationSettings,
+    ) -> ModerateResponse | None:
+        """
+        Permite directamente el contenido si coincide con
+        alguna expresión incluida en la whitelist.
+        """
+
+        matching_word = next(
+            (
+                word
+                for word in settings.whitelist
+                if word.casefold().strip()
+                and word.casefold().strip() in content
+            ),
+            None,
+        )
+
+        if matching_word is None:
+            return None
 
         return ModerateResponse(
             decision=ModerationDecision.APPROVE,
@@ -90,11 +96,45 @@ class ModerationService:
             score=0.0,
             categories=[],
             reason=(
-                "El contenido ha sido aprobado porque no se ha "
-                "detectado información personal y el módulo de "
-                "toxicidad está desactivado."
+                "El contenido coincide con una expresión "
+                "incluida en la lista blanca."
             ),
-            model="moderation-settings",
+            model="whitelist-rule",
+        )
+
+    @staticmethod
+    def _moderate_blacklist(
+        content: str,
+        settings: ModerationSettings,
+    ) -> ModerateResponse | None:
+        """
+        Rechaza directamente el contenido si coincide con
+        alguna expresión incluida en la blacklist.
+        """
+
+        matching_word = next(
+            (
+                word
+                for word in settings.blacklist
+                if word.casefold().strip()
+                and word.casefold().strip() in content
+            ),
+            None,
+        )
+
+        if matching_word is None:
+            return None
+
+        return ModerateResponse(
+            decision=ModerationDecision.REJECT,
+            allowed=False,
+            score=1.0,
+            categories=[],
+            reason=(
+                "El contenido contiene una expresión "
+                "incluida en la lista negra."
+            ),
+            model="blacklist-rule",
         )
 
     def _moderate_pii(
@@ -103,8 +143,8 @@ class ModerationService:
         settings: ModerationSettings,
     ) -> ModerateResponse | None:
         """
-        Ejecuta PII y conserva únicamente las categorías que estén
-        activadas en la configuración.
+        Ejecuta la detección de información personal si el
+        módulo PII está activado.
         """
 
         if not settings.pii.enabled:
@@ -112,130 +152,130 @@ class ModerationService:
 
         pii_result = self.pii_service.analyze(content)
 
-        enabled_detections = [
-            detection
-            for detection in pii_result.categories
+        if not pii_result.detected:
+            return None
+
+        enabled_categories = self._get_enabled_pii_categories(
+            settings
+        )
+
+        filtered_categories = [
+            category
+            for category in pii_result.categories
             if self._is_pii_category_enabled(
-                label=detection.label,
-                categories=settings.pii.categories,
+                label=category.label,
+                enabled_categories=enabled_categories,
             )
         ]
 
-        if not enabled_detections:
+        if not filtered_categories:
             return None
-
-        highest_score = max(
-            detection.score
-            for detection in enabled_detections
-        )
 
         return ModerateResponse(
             decision=ModerationDecision.REJECT,
             allowed=False,
-            score=highest_score,
-            categories=enabled_detections,
-            reason=(
-                "El contenido parece incluir una categoría de "
-                "información personal o financiera que está "
-                "activada en la configuración."
-            ),
+            score=1.0,
+            categories=filtered_categories,
+            reason=pii_result.reason,
             model=PiiService.MODEL_NAME,
         )
 
-    @staticmethod
-    def _normalize(value: str) -> str:
+    def _moderate_toxicity(
+        self,
+        content: str,
+        settings: ModerationSettings,
+    ) -> ModerateResponse:
         """
-        Normaliza textos para realizar comparaciones sin distinguir
-        mayúsculas, minúsculas ni espacios exteriores.
-        """
-
-        return value.strip().casefold()
-
-    @classmethod
-    def _matches_whitelist(
-        cls,
-        normalized_content: str,
-        whitelist: list[str],
-    ) -> bool:
-        """
-        La lista blanca requiere coincidencia con el contenido
-        completo.
-
-        Ejemplo:
-            whitelist = ["hola mundo"]
-
-            "Hola mundo"         -> coincide
-            "Hola mundo 1234"    -> no coincide
+        Ejecuta el modelo de toxicidad utilizando el umbral
+        dinámico configurado desde el dashboard.
         """
 
-        normalized_whitelist = {
-            cls._normalize(entry)
-            for entry in whitelist
-            if entry.strip()
-        }
+        if not settings.toxicity.enabled:
+            return ModerateResponse(
+                decision=ModerationDecision.APPROVE,
+                allowed=True,
+                score=0.0,
+                categories=[],
+                reason=(
+                    "El análisis de toxicidad está "
+                    "desactivado."
+                ),
+                model=ToxicityService.MODEL_NAME,
+            )
 
-        return normalized_content in normalized_whitelist
-
-    @classmethod
-    def _matches_blacklist(
-        cls,
-        normalized_content: str,
-        blacklist: list[str],
-    ) -> bool:
-        """
-        La lista negra comprueba si alguna expresión configurada
-        está contenida en el texto.
-        """
-
-        return any(
-            cls._normalize(entry) in normalized_content
-            for entry in blacklist
-            if entry.strip()
+        toxicity_result = self.toxicity_service.analyze(
+            content=content,
+            threshold=settings.toxicity.threshold,
         )
+
+        decision = (
+            ModerationDecision.REJECT
+            if toxicity_result.detected
+            else ModerationDecision.APPROVE
+        )
+
+        return ModerateResponse(
+            decision=decision,
+            allowed=not toxicity_result.detected,
+            score=round(
+                toxicity_result.score,
+                6,
+            ),
+            categories=toxicity_result.categories,
+            reason=toxicity_result.reason,
+            model=toxicity_result.model,
+        )
+
+    @staticmethod
+    def _get_enabled_pii_categories(
+        settings: ModerationSettings,
+    ) -> dict[str, bool]:
+        """
+        Convierte la configuración PII de Pydantic en un
+        diccionario sencillo.
+        """
+
+        categories = settings.pii.categories
+
+        if hasattr(categories, "model_dump"):
+            return categories.model_dump()
+
+        if isinstance(categories, dict):
+            return categories
+
+        return {}
 
     @staticmethod
     def _is_pii_category_enabled(
         label: str,
-        categories: PiiCategorySettings,
+        enabled_categories: dict[str, bool],
     ) -> bool:
         """
-        Relaciona las etiquetas internas de PiiService con los
-        parámetros configurables expuestos al dashboard.
+        Relaciona las etiquetas internas de PiiService con
+        las categorías expuestas en el dashboard.
         """
 
-        category_mapping = {
-            "spanish-national-id": categories.dni,
-            "spanish-foreigner-id": categories.nie,
-            "email-address": categories.email,
-            "phone-number": categories.phone,
-            "bank-account": categories.iban,
-            "payment-card": categories.credit_card,
-            "credential": categories.credential,
-            "person": categories.person,
-            "location": categories.location,
+        label_to_setting = {
+            "email-address": "email",
+            "phone-number": "phone",
+            "spanish-national-id": "dni",
+            "spanish-foreigner-id": "nie",
+            "bank-account": "iban",
+            "payment-card": "credit_card",
+            "credential": "credential",
+            "person": "person",
+            "location": "location",
         }
 
-        return category_mapping.get(label, False)
+        setting_name = label_to_setting.get(label)
 
-    @staticmethod
-    def _build_policy_response(
-        decision: ModerationDecision,
-        label: str,
-        reason: str,
-    ) -> ModerateResponse:
-        allowed = decision == ModerationDecision.APPROVE
-        score = 0.0 if allowed else 1.0
+        if setting_name is None:
+            return True
 
-        return ModerateResponse(
-            decision=decision,
-            allowed=allowed,
-            score=score,
-            categories=[
-                CategoryResult(
-                    label=label,
-                    score=1.0,
-                )
-            ],
-            reason=reason,
-            model="configurable-policy-rules",
+        return enabled_categories.get(
+            setting_name,
+            True,
         )
+
+
+moderation_service = ModerationService()

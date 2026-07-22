@@ -236,7 +236,7 @@ class PiiService:
 
         self._append_if_matches(
             content,
-            self.PHONE_CONTEXT_PATTERN,
+            self.PHONE_PATTERN,
             "phone-number",
             detections,
         )

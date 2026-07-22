@@ -1,205 +1,385 @@
-from typing import Any
+import logging
+import time
+from dataclasses import dataclass
 
-from transformers import pipeline
-
-from app.schemas.moderation import (
-    CategoryResult,
-    ModerateResponse,
-    ModerationDecision,
+import torch
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
 )
 
+from app.schemas.moderation import CategoryResult
 
-MODEL_NAME = (
-    "gravitee-io/"
-    "distilbert-multilingual-toxicity-classifier"
-)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ToxicityAnalysis:
+    detected: bool
+    score: float
+    categories: list[CategoryResult]
+    reason: str
+    model: str
 
 
 class ToxicityService:
     """
-    Servicio encargado de analizar la toxicidad de un texto.
+    Analiza la toxicidad de un texto mediante un modelo Transformer.
 
-    El umbral de rechazo se recibe dinámicamente desde la
-    configuración global de moderación.
+    Además, registra en consola:
+
+    - Texto recibido.
+    - Tokens.
+    - Identificadores de tokens.
+    - Máscara de atención.
+    - Logits.
+    - Probabilidades.
+    - Score de toxicidad.
+    - Umbral.
+    - Decisión.
+    - Tiempo de inferencia.
     """
 
-    DEFAULT_REJECT_THRESHOLD = 0.80
+    MODEL_NAME = (
+        "gravitee-io/"
+        "distilbert-multilingual-toxicity-classifier"
+    )
+
+    MAX_LENGTH = 512
+    MAX_LOGGED_TOKENS = 80
 
     def __init__(self) -> None:
-        self.classifier = self._load_model()
+        logger.info(
+            "[TOXICITY] Cargando tokenizer: %s",
+            self.MODEL_NAME,
+        )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.MODEL_NAME
+        )
+
+        logger.info(
+            "[TOXICITY] Cargando modelo: %s",
+            self.MODEL_NAME,
+        )
+
+        self.model = (
+            AutoModelForSequenceClassification
+            .from_pretrained(self.MODEL_NAME)
+        )
+
+        # Modo inferencia: desactiva dropout.
+        self.model.eval()
+
+        logger.info(
+            "[TOXICITY] Etiquetas id2label: %s",
+            self.model.config.id2label,
+        )
+
+        logger.info(
+            "[TOXICITY] Etiquetas label2id: %s",
+            self.model.config.label2id,
+        )
+
+        logger.info(
+            "[TOXICITY] Modelo cargado correctamente."
+        )
+
+    def analyze(
+        self,
+        content: str,
+        threshold: float,
+    ) -> ToxicityAnalysis:
+        """
+        Analiza un texto y compara su score de toxicidad
+        con el umbral configurado.
+        """
+
+        start_time = time.perf_counter()
+
+        # 1. Tokenización.
+        encoded = self.tokenizer(
+            content,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.MAX_LENGTH,
+            padding=False,
+        )
+
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+
+        token_ids = input_ids[0].tolist()
+
+        tokens = self.tokenizer.convert_ids_to_tokens(
+            token_ids
+        )
+
+        # 2. Inferencia.
+        #
+        # inference_mode evita calcular gradientes, ya que
+        # aquí no estamos entrenando el modelo.
+        with torch.inference_mode():
+            outputs = self.model(**encoded)
+
+        # Para una única entrada:
+        # outputs.logits tiene forma [1, número_de_clases].
+        logits_tensor = outputs.logits[0]
+
+        # 3. Conversión de logits a probabilidades.
+        probabilities_tensor = torch.softmax(
+            logits_tensor,
+            dim=-1,
+        )
+
+        logits = logits_tensor.tolist()
+        probabilities = probabilities_tensor.tolist()
+
+        # 4. Asociar cada posición con su etiqueta.
+        scores_by_label: dict[str, float] = {}
+
+        for class_id, probability in enumerate(
+            probabilities
+        ):
+            label = self._get_label(class_id)
+
+            scores_by_label[
+                self._normalize_label(label)
+            ] = float(probability)
+
+        # 5. Extraer específicamente el score tóxico.
+        toxic_score = self._extract_toxic_score(
+            scores_by_label
+        )
+
+        # 6. Aplicar la política configurable.
+        detected = toxic_score >= threshold
+
+        decision = (
+            "REJECT"
+            if detected
+            else "ALLOW"
+        )
+
+        elapsed_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        # 7. Mostrar trazabilidad.
+        self._log_analysis(
+            content=content,
+            tokens=tokens,
+            input_ids=token_ids,
+            attention_mask=attention_mask[0].tolist(),
+            logits=logits,
+            probabilities=probabilities,
+            threshold=threshold,
+            toxic_score=toxic_score,
+            decision=decision,
+            elapsed_ms=elapsed_ms,
+        )
+
+        if detected:
+            return ToxicityAnalysis(
+                detected=True,
+                score=toxic_score,
+                categories=[
+                    CategoryResult(
+                        label="toxicity",
+                        score=toxic_score,
+                    )
+                ],
+                reason=(
+                    "El contenido supera el umbral "
+                    "de toxicidad configurado."
+                ),
+                model=self.MODEL_NAME,
+            )
+
+        return ToxicityAnalysis(
+            detected=False,
+            score=toxic_score,
+            categories=[],
+            reason=(
+                "El contenido no supera el umbral "
+                "de toxicidad configurado."
+            ),
+            model=self.MODEL_NAME,
+        )
+
+    def _get_label(
+        self,
+        class_id: int,
+    ) -> str:
+        """
+        Obtiene la etiqueta asociada a una salida del modelo.
+        """
+
+        id2label = self.model.config.id2label
+
+        # Algunas configuraciones usan claves enteras y otras
+        # pueden exponerlas como cadenas.
+        return str(
+            id2label.get(
+                class_id,
+                id2label.get(
+                    str(class_id),
+                    f"LABEL_{class_id}",
+                ),
+            )
+        )
 
     @staticmethod
-    def _load_model() -> Any:
+    def _normalize_label(label: str) -> str:
         """
-        Carga el modelo y su tokenizador.
-
-        La primera vez puede descargar los archivos desde
-        Hugging Face. Después se reutilizan desde la caché local.
+        Normaliza variantes de escritura de etiquetas.
         """
 
-        return pipeline(
-            task="text-classification",
-            model=MODEL_NAME,
-            tokenizer=MODEL_NAME,
-            device=-1,
+        return (
+            label
+            .casefold()
+            .strip()
+            .replace("_", "-")
+            .replace(" ", "-")
         )
-
-    def moderate(
-        self,
-        content: str,
-        threshold: float = DEFAULT_REJECT_THRESHOLD,
-    ) -> ModerateResponse:
-        """
-        Analiza el texto aplicando el umbral indicado.
-
-        Args:
-            content: Texto que se quiere analizar.
-            threshold: Puntuación mínima para rechazar el contenido.
-
-        Returns:
-            Resultado completo de la moderación.
-
-        Raises:
-            ValueError: Si el umbral no está entre 0 y 1.
-            RuntimeError: Si el modelo devuelve un resultado inválido.
-        """
-
-        if not 0.0 <= threshold <= 1.0:
-            raise ValueError(
-                "El umbral de toxicidad debe estar entre 0 y 1."
-            )
-
-        prediction = self._predict(content)
-
-        toxic_score = self._extract_toxic_score(
-            prediction
-        )
-
-        decision = self._get_decision(
-            toxic_score=toxic_score,
-            threshold=threshold,
-        )
-
-        rounded_score = round(toxic_score, 6)
-
-        return ModerateResponse(
-            decision=decision,
-            allowed=(
-                decision == ModerationDecision.APPROVE
-            ),
-            score=rounded_score,
-            categories=[
-                CategoryResult(
-                    label="toxicity",
-                    score=rounded_score,
-                )
-            ],
-            reason=self._get_reason(
-                decision=decision,
-                threshold=threshold,
-            ),
-            model=MODEL_NAME,
-        )
-
-    def _predict(
-        self,
-        content: str,
-    ) -> dict[str, Any]:
-        """
-        Envía el texto al modelo y devuelve su predicción.
-        """
-
-        predictions = self.classifier(
-            content,
-            truncation=True,
-        )
-
-        if not predictions:
-            raise RuntimeError(
-                "El modelo no ha devuelto ninguna predicción."
-            )
-
-        prediction = predictions[0]
-
-        if not isinstance(prediction, dict):
-            raise RuntimeError(
-                "El modelo ha devuelto un formato inesperado."
-            )
-
-        return prediction
 
     @staticmethod
     def _extract_toxic_score(
-        prediction: dict[str, Any],
+        scores_by_label: dict[str, float],
     ) -> float:
         """
-        Convierte la respuesta del modelo en una escala común:
-
-        0.0 = toxicidad muy baja
-        1.0 = toxicidad muy alta
+        Busca la etiqueta correspondiente a toxicidad.
         """
 
-        label = str(
-            prediction.get("label", "")
-        ).strip().lower()
-
-        score = float(
-            prediction.get("score", 0.0)
-        )
-
-        toxic_labels = {
+        toxic_labels = (
             "toxic",
             "toxicity",
-            "label_1",
-        }
-
-        non_toxic_labels = {
-            "not-toxic",
-            "not_toxic",
-            "non-toxic",
-            "non_toxic",
-            "label_0",
-        }
-
-        if label in toxic_labels:
-            return score
-
-        if label in non_toxic_labels:
-            return 1.0 - score
-
-        raise RuntimeError(
-            f"Etiqueta desconocida devuelta por el modelo: {label}"
+            "label-1",
         )
 
-    @staticmethod
-    def _get_decision(
+        for label in toxic_labels:
+            if label in scores_by_label:
+                return scores_by_label[label]
+
+        raise RuntimeError(
+            "No se ha encontrado la clase de toxicidad. "
+            "Etiquetas disponibles: "
+            f"{list(scores_by_label.keys())}"
+        )
+
+    def _log_analysis(
+        self,
+        *,
+        content: str,
+        tokens: list[str],
+        input_ids: list[int],
+        attention_mask: list[int],
+        logits: list[float],
+        probabilities: list[float],
+        threshold: float,
         toxic_score: float,
-        threshold: float,
-    ) -> ModerationDecision:
+        decision: str,
+        elapsed_ms: float,
+    ) -> None:
         """
-        Convierte la puntuación en una decisión binaria usando
-        el umbral configurado.
+        Registra en consola las principales etapas
+        de la clasificación.
         """
 
-        if toxic_score >= threshold:
-            return ModerationDecision.REJECT
+        logged_tokens = tokens[
+            :self.MAX_LOGGED_TOKENS
+        ]
 
-        return ModerationDecision.APPROVE
+        logged_input_ids = input_ids[
+            :self.MAX_LOGGED_TOKENS
+        ]
 
-    @staticmethod
-    def _get_reason(
-        decision: ModerationDecision,
-        threshold: float,
-    ) -> str:
-        formatted_threshold = round(threshold, 3)
+        logged_attention_mask = attention_mask[
+            :self.MAX_LOGGED_TOKENS
+        ]
 
-        if decision == ModerationDecision.REJECT:
-            return (
-                "El contenido supera el umbral de toxicidad "
-                f"configurado ({formatted_threshold})."
+        was_truncated = (
+            len(tokens) > self.MAX_LOGGED_TOKENS
+        )
+
+        suffix = (
+            " ..."
+            if was_truncated
+            else ""
+        )
+
+        logger.info(
+            "[TOXICITY] Texto recibido: %s",
+            content,
+        )
+
+        logger.info(
+            "[TOXICITY] Tokens: %s%s",
+            logged_tokens,
+            suffix,
+        )
+
+        logger.info(
+            "[TOXICITY] Input IDs: %s%s",
+            logged_input_ids,
+            suffix,
+        )
+
+        logger.info(
+            "[TOXICITY] Attention mask: %s%s",
+            logged_attention_mask,
+            suffix,
+        )
+
+        rounded_logits = [
+            round(value, 4)
+            for value in logits
+        ]
+
+        logger.info(
+            "[TOXICITY] Logits: %s",
+            rounded_logits,
+        )
+
+        logger.info(
+            "[TOXICITY] Probabilidades:"
+        )
+
+        for class_id, probability in enumerate(
+            probabilities
+        ):
+            label = self._get_label(class_id)
+
+            logger.info(
+                "  %-12s = %.4f",
+                label,
+                probability,
             )
 
-        return (
-            "El contenido no supera el umbral de toxicidad "
-            f"configurado ({formatted_threshold})."
+        logger.info(
+            "[TOXICITY] Score tóxico: %.4f",
+            toxic_score,
+        )
+
+        logger.info(
+            "[TOXICITY] Threshold: %.4f",
+            threshold,
+        )
+
+        logger.info(
+            "[TOXICITY] Comparación: %.4f %s %.4f",
+            toxic_score,
+            ">=" if decision == "REJECT" else "<",
+            threshold,
+        )
+
+        logger.info(
+            "[TOXICITY] Decisión: %s",
+            decision,
+        )
+
+        logger.info(
+            "[TOXICITY] Tiempo de inferencia: %.2f ms",
+            elapsed_ms,
         )
