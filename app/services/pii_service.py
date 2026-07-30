@@ -160,15 +160,13 @@ class PiiService:
             | escríbeme
             | escribeme
         )
-        \s*
         (?:
-            es
-            |:
-            |-
-            |al
-            |de
-        )?
-        \s*
+            \s+(?:es|al|a|de)
+            |
+            \s*[:=\-]\s*
+            |
+            \s+
+        )
         (?:
             \+34[\s.-]*
         )?
