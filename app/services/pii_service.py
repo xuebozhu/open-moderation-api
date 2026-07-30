@@ -155,6 +155,8 @@ class PiiService:
             | whatsapp
             | bizum
             | llamar
+            | llama
+            | llame
             | llámame
             | llamame
             | escríbeme
@@ -167,6 +169,7 @@ class PiiService:
             |
             \s+
         )
+        \s*
         (?:
             \+34[\s.-]*
         )?
