@@ -12,6 +12,8 @@ Open source AI moderation API.
 ## Run
 
 uvicorn app.main:app --reload
+ó (Si python no esta en el PATH)
+py -m uvicorn app.main:app --reload
 
 ##Usage
 http://localhost:8000/docs#/Settings/update_settings_api_v1_settings_put
